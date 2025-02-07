@@ -11,11 +11,11 @@ from transformers import AutoTokenizer
 
 class EmbeddingWrapper(ABC):
     @abstractmethod
-    def embed_documents(self, documents: list[str]) -> np.ndarray:
+    def embed_documents(self, documents: list[str], **kwargs) -> np.ndarray:
         pass
 
     @abstractmethod
-    def embed_query(self, query: str) -> np.ndarray:
+    def embed_query(self, query: str, **kwargs) -> np.ndarray:
         pass
 
 
@@ -28,18 +28,21 @@ class SentenceTransformerEmbedder(EmbeddingWrapper):
         query_kwargs: dict[str, Any] | None = None,
     ) -> None:
         # TODO: when do I need `output_value='token_embeddings'`?
-        # TODO: allow to add kwargs, e.g. `return_offsets_mapping=True`
         self._document_kwargs = document_kwargs if document_kwargs is not None else {}
         self._query_kwargs = query_kwargs if query_kwargs is not None else {}
 
         model_kwargs = model_kwargs if model_kwargs is not None else {}
         self.model = SentenceTransformer(model_name, **model_kwargs)
 
-    def embed_documents(self, documents: list[str]) -> np.ndarray:
-        return self.model.encode(documents, **self._document_kwargs)
+    def embed_documents(self, documents: list[str], **kwargs) -> np.ndarray:
+        final_kwargs = self._document_kwargs.copy()
+        final_kwargs.update(kwargs)
+        return self.model.encode(documents, **final_kwargs)
 
-    def embed_query(self, query: str) -> np.ndarray:
-        return self.model.encode(query, **self._query_kwargs)
+    def embed_query(self, query: str, **kwargs) -> np.ndarray:
+        final_kwargs = self._query_kwargs.copy()
+        final_kwargs.update(kwargs)
+        return self.model.encode(query, **final_kwargs)
 
 
 class LateEmbedder:
