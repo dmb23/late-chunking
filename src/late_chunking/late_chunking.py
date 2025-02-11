@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from loguru import logger
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer
 
 
 class EmbeddingWrapper(ABC):
@@ -50,42 +49,32 @@ class LateEmbedder:
 
     This method allows to have more context information in chunk embeddings,
     as developed and demonstrated by Jina AI.
-
-    TODO:
-    - Jina3, Nomic rely on prefixes for encoding
-    - hand in a class that allows to encode query, encode documents
-        - simple wrapper to create from HF AutoModel
     """
 
     def __init__(
         self,
-        tokenizer_name: str,
-        embedder: EmbeddingWrapper,
-        trust_remote_code: bool = True,
+        embedder: SentenceTransformer,
         max_seq_length: int = 8192,
         max_seq_overlap: int = 500,
     ) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name, trust_remote_code=trust_remote_code
-        )
-        self.embedding_model = embedder
+        self.embedder = embedder
         self.max_seq_length = max_seq_length
-        self.max_Seq_overlap = max_seq_overlap
+        self.max_seq_overlap = max_seq_overlap
 
     def _map_chunks_to_tokens(
-        self, chunk_annotations: list[tuple[int, int]], token_offsets: np.ndarray
+        self, chunk_annotations: list[tuple[int, int]], token_offsets: torch.Tensor
     ) -> list[tuple[int, int]]:
-        """Translate chunk boundaries from text to token space, handling misalignments
+        """Translate chunk boundaries from text to token space.
 
-        Semantic Segmentation needs to adjust chunk boundaries slightly,
-        this can lead to misalignment with tokens.
-
-        Especially when using late chunking, the exact boundaries of chunks in token space
+        When using late chunking, the exact boundaries of chunks in token space
         should not matter that much.
+
+        Args:
+            chunk_annotations: list of (chunk_start_index, chunk_end_index), positions measured in the text
+            token_offsets: list of (token_start_idndex, token_end_index), positions measured in the text
+        Returns:
+            list of (chunk_start_token_index, chunk_end_token_index) for the tokenized text
         """
-        logger.debug(
-            f"Mapping {len(chunk_annotations)} chunks onto {len(token_offsets)} tokens"
-        )
         token_chunk_annotations = []
 
         for chunk_start, chunk_end in chunk_annotations:
@@ -112,99 +101,96 @@ class LateEmbedder:
                 )
                 end_token = start_token + 1
 
-            token_chunk_annotations.append((start_token, end_token))
+            token_chunk_annotations.append((start_token.item(), end_token.item()))
 
         return token_chunk_annotations
 
-    def _get_long_token_embeddings(self, model_inputs):
-        """Handle inputs that might be longer than the embedding model can handle.
+    def _get_long_token_embeddings(
+        self, full_text: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """TODO: adjust that to more general case
+
+        Handle inputs that might be longer than the embedding model can handle.
 
         Jina uses lower long-chunk sizes than the 8K tokens the model is capable of.
         Also: this method is not tested for multi-sequence inputs!
+
+        Args:
+            full_text: Text to tokenize. Can be longer than the maximum sequence length of the embedding model.
+
+        Returns:
+            token_embeddings: embedding vectors for each token in the text
+            token_offsets: mapping of the tokens to their positions in the original text
         """
-        task = "retrieval.passage"
-        task_id = self.embedding_model._adaptation_map[task]
-
-        max_seq_length = config.conf.select(
-            "embeddings.late_chunking.long_seq_length", 2048
+        tokens = self.embedder.tokenizer(
+            full_text, return_offsets_mapping=True, return_tensors="pt", verbose=False
         )
+        n_tokens = tokens["input_ids"].numel()
+        token_offsets = tokens["offset_mapping"].squeeze()
 
-        # only single string `input_text`
-        adapter_mask = torch.full((1,), task_id, dtype=torch.int32)
+        device = self.embedder.device
 
-        if model_inputs["input_ids"].numel() <= max_seq_length:
-            with torch.no_grad():
-                model_output = self.embedding_model(
-                    **model_inputs, adapter_mask=adapter_mask
+        if n_tokens <= self.max_seq_length:
+            for key in tokens:
+                tokens[key] = (
+                    tokens[key].to(device)
+                    if isinstance(tokens[key], torch.Tensor)
+                    else tokens[key]
                 )
+            with torch.no_grad():
+                model_output = self.embedder(tokens)
 
-            token_embeddings = model_output["last_hidden_state"].squeeze(0).float()
-
+            token_embeddings = model_output["token_embeddings"].squeeze(0)
         else:
-            # Split tokens into overlapping chunks
-            overlap = config.conf.select("index.late_chunking.long_seq_overlap", 256)
-            chunks = []
-            chunk_embeddings = []
+            _chunks = []
+            _chunk_embeddings = []
 
             # Create chunks with overlap
-            for i in range(
-                0, len(model_inputs["input_ids"].squeeze()), max_seq_length - overlap
-            ):
-                chunk = {
-                    k: v[:, i : i + max_seq_length]
+            for i in range(0, n_tokens, self.max_seq_length - self.max_seq_overlap):
+                _chunk = {
+                    k: v[:, i : i + self.max_seq_length].to(device)
                     if isinstance(v, torch.Tensor)
                     else v
-                    for k, v in model_inputs.items()
+                    for k, v in tokens.items()
                 }
-                chunks.append(chunk)
+                _chunks.append(_chunk)
 
             # Get embeddings for each chunk
-            for chunk in chunks:
+            for _chunk in _chunks:
                 with torch.no_grad():
-                    chunk_output = self.embedding_model(
-                        **chunk, adapter_mask=adapter_mask
-                    )
-                chunk_embeddings.append(
-                    chunk_output["last_hidden_state"].squeeze(0).float()
-                )
+                    chunk_output = self.embedder(_chunk)
+                _chunk_embeddings.append(chunk_output["token_embeddings"].squeeze(0))
 
-            # Combine embeddings from overlapping regions by averaging
-            # NOTE: reference implementation of Jina only uses the embeddings of the later chunk
-            # https://github.com/jina-ai/late-chunking/blob/main/chunked_pooling/mteb_chunked_eval.py#L128
             token_embeddings = torch.zeros(
-                (len(model_inputs["input_ids"][0]), chunk_embeddings[0].shape[1]),
-                dtype=chunk_embeddings[0].dtype,
-            )
+                (n_tokens, _chunk_embeddings[0].shape[1]),
+                dtype=_chunk_embeddings[0].dtype,
+            ).to(device)
 
-            counts = torch.zeros(len(model_inputs["input_ids"][0]), dtype=torch.int)
+            counts = torch.zeros(n_tokens, dtype=torch.int).to(device)
 
             pos = 0
-            for chunk_emb in chunk_embeddings:
+            for chunk_emb in _chunk_embeddings:
                 chunk_size = chunk_emb.shape[0]
                 token_embeddings[pos : pos + chunk_size] += chunk_emb
                 counts[pos : pos + chunk_size] += 1
-                pos += max_seq_length - overlap
+                pos += self.max_seq_length - self.max_seq_overlap
 
             # Average overlapping regions
             token_embeddings = token_embeddings / counts.unsqueeze(1)
 
-        return token_embeddings
+        return token_embeddings, token_offsets
 
     def calculate_late_embeddings(
         self, input_text: str, chunk_annotations: list[tuple[int, int]]
-    ) -> list[list[float]]:
-        """Calculate late embeddings for chunks in a longer text"""
-        task = "retrieval.passage"
-        task_prefix = self.embedding_model._task_instructions[task]
+    ) -> np.typing.NDArray:
+        """Calculate late embeddings for chunks in a longer text
 
-        inputs = self.tokenizer(
-            task_prefix + input_text, return_tensors="pt", return_offsets_mapping=True
-        )
+        Args:
+            input_text: a full text for which embeddings of chunks should be calculated
+            chunk_annotations: a list of (chunk_start_index, chunk_end_index) that identify the chunks for the text
+        """
+        token_embeddings, token_offsets = self._get_long_token_embeddings(input_text)
 
-        token_embeddings = self._get_long_token_embeddings(inputs)
-
-        # task prefix was added for Jina v3, correct for that
-        token_offsets = inputs["offset_mapping"].squeeze(0).numpy() - len(task_prefix)
         token_chunk_annotations = self._map_chunks_to_tokens(
             chunk_annotations, token_offsets
         )
@@ -214,15 +200,9 @@ class LateEmbedder:
             for start, end in token_chunk_annotations
         ]
         pooled_embeddings = [
-            F.normalize(embedding, p=2, dim=0).detach().cpu().tolist()
+            F.normalize(embedding, p=2, dim=0).detach().cpu().numpy()[None, :]
             for embedding in pooled_embeddings
         ]
+        pooled_embeddings = np.concat(pooled_embeddings, 0)
 
         return pooled_embeddings
-
-    def calculate_embeddings(
-        self, input_text: str, task="retrieval.passage"
-    ) -> list[float]:
-        """Use Embedding Model directly"""
-        embeddings = self.embedding_model.encode([input_text], task=task)[0]
-        return embeddings
