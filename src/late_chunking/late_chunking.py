@@ -179,10 +179,10 @@ class LateEmbedder:
             with torch.no_grad():
                 model_output = self.embedder(tokens)
 
-            # Exclude prefix tokens from output
-            token_embeddings = model_output["token_embeddings"].squeeze(0)[
-                prefix_length:
-            ]
+            # Exclude prefix tokens and leading special tokens from output
+            start_idx = leading_special + prefix_length
+            end_idx = -trailing_special if trailing_special > 0 else None
+            token_embeddings = model_output["token_embeddings"].squeeze(0)[start_idx:end_idx]
         else:
             chunks = []
             chunk_embeddings = []
