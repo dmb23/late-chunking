@@ -97,29 +97,41 @@ class LateEmbedder:
     def _get_long_token_embeddings(
         self, full_text: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """TODO: adjust that to more general case
+        """Handle inputs that might be longer than the embedding model can handle.
 
-        Handle inputs that might be longer than the embedding model can handle.
-
-        Jina uses lower long-chunk sizes than the 8K tokens the model is capable of.
-        Also: this method is not tested for multi-sequence inputs!
+        Adds document prefix before each chunk and excludes prefix tokens from output.
 
         Args:
             full_text: Text to tokenize. Can be longer than the maximum sequence length of the embedding model.
 
         Returns:
-            token_embeddings: embedding vectors for each token in the text
+            token_embeddings: embedding vectors for each token in the text (excluding prefix tokens)
             token_offsets: mapping of the tokens to their positions in the original text
         """
-        tokens = self.embedder.tokenizer(
+        # First tokenize just the prefix to know its length
+        prefix_tokens = self.embedder.tokenizer(
+            self._document_prefix, return_tensors="pt", verbose=False
+        )
+        prefix_length = prefix_tokens["input_ids"].shape[1]
+
+        # Tokenize full text to get offsets
+        base_tokens = self.embedder.tokenizer(
             full_text, return_offsets_mapping=True, return_tensors="pt", verbose=False
         )
-        n_tokens = tokens["input_ids"].numel()
-        token_offsets = tokens["offset_mapping"].squeeze()
+        n_tokens = base_tokens["input_ids"].numel()
+        token_offsets = base_tokens["offset_mapping"].squeeze()
 
         device = self.embedder.device
 
-        if n_tokens <= self.max_seq_length:
+        if n_tokens <= self.max_seq_length - prefix_length:
+            # For short texts, add prefix once
+            tokens = self.embedder.tokenizer(
+                self._document_prefix + full_text,
+                return_offsets_mapping=True,
+                return_tensors="pt",
+                verbose=False,
+            )
+            
             for key in tokens:
                 tokens[key] = (
                     tokens[key].to(device)
@@ -129,18 +141,25 @@ class LateEmbedder:
             with torch.no_grad():
                 model_output = self.embedder(tokens)
 
-            token_embeddings = model_output["token_embeddings"].squeeze(0)
+            # Exclude prefix tokens from output
+            token_embeddings = model_output["token_embeddings"].squeeze(0)[prefix_length:]
         else:
             _chunks = []
             _chunk_embeddings = []
 
-            # Create chunks with overlap
-            for i in range(0, n_tokens, self.max_seq_length - self.max_seq_overlap):
+            # Create chunks with overlap, adding prefix to each
+            for i in range(0, n_tokens, self.max_seq_length - self.max_seq_overlap - prefix_length):
+                chunk_text = self._document_prefix + full_text[
+                    token_offsets[i, 0].item():token_offsets[min(i + self.max_seq_length - prefix_length, n_tokens - 1), 1].item()
+                ]
+                _chunk = self.embedder.tokenizer(
+                    chunk_text,
+                    return_tensors="pt",
+                    verbose=False
+                )
                 _chunk = {
-                    k: v[:, i : i + self.max_seq_length].to(device)
-                    if isinstance(v, torch.Tensor)
-                    else v
-                    for k, v in tokens.items()
+                    k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in _chunk.items()
                 }
                 _chunks.append(_chunk)
 
@@ -148,7 +167,8 @@ class LateEmbedder:
             for _chunk in _chunks:
                 with torch.no_grad():
                     chunk_output = self.embedder(_chunk)
-                _chunk_embeddings.append(chunk_output["token_embeddings"].squeeze(0))
+                # Exclude prefix tokens
+                _chunk_embeddings.append(chunk_output["token_embeddings"].squeeze(0)[prefix_length:])
 
             token_embeddings = torch.zeros(
                 (n_tokens, _chunk_embeddings[0].shape[1]),
@@ -162,7 +182,7 @@ class LateEmbedder:
                 chunk_size = chunk_emb.shape[0]
                 token_embeddings[pos : pos + chunk_size] += chunk_emb
                 counts[pos : pos + chunk_size] += 1
-                pos += self.max_seq_length - self.max_seq_overlap
+                pos += self.max_seq_length - self.max_seq_overlap - prefix_length
 
             # Average overlapping regions
             token_embeddings = token_embeddings / counts.unsqueeze(1)
