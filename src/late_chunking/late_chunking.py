@@ -1,6 +1,3 @@
-from abc import ABC, abstractmethod
-from typing import Any
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,47 +5,21 @@ from loguru import logger
 from sentence_transformers import SentenceTransformer
 
 
-class EmbeddingWrapper(ABC):
-    @abstractmethod
-    def embed_documents(self, documents: list[str], **kwargs) -> np.ndarray:
-        pass
-
-    @abstractmethod
-    def embed_query(self, query: str, **kwargs) -> np.ndarray:
-        pass
-
-
-class SentenceTransformerEmbedder(EmbeddingWrapper):
-    def __init__(
-        self,
-        model_name: str,
-        model_kwargs: dict[str, Any] | None = None,
-        document_kwargs: dict[str, Any] | None = None,
-        query_kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        # TODO: when do I need `output_value='token_embeddings'`?
-        self._document_kwargs = document_kwargs if document_kwargs is not None else {}
-        self._query_kwargs = query_kwargs if query_kwargs is not None else {}
-
-        model_kwargs = model_kwargs if model_kwargs is not None else {}
-        self.model = SentenceTransformer(model_name, **model_kwargs)
-
-    def embed_documents(self, documents: list[str], **kwargs) -> np.ndarray:
-        final_kwargs = self._document_kwargs.copy()
-        final_kwargs.update(kwargs)
-        return self.model.encode(documents, **final_kwargs)
-
-    def embed_query(self, query: str, **kwargs) -> np.ndarray:
-        final_kwargs = self._query_kwargs.copy()
-        final_kwargs.update(kwargs)
-        return self.model.encode(query, **final_kwargs)
-
-
 class LateEmbedder:
     """Calculate chunk embeddings via late chunking.
 
-    This method allows to have more context information in chunk embeddings,
-    as developed and demonstrated by Jina AI.
+    Late Chunking is an embedding method that keeps long context information
+    inside chunk embeddings. Token-level embeddings are calculated for the
+    full text initially to keep context information in a long-context
+    embedding model. Only after that the (tokenized & embedded) text is
+    cut into chunks and the embeddings are averaged.
+
+    Args:
+        model_name: name of a Sentence Transformer model
+        model_kwargs:  dict of kwargs to be passed to model instantiation
+        max_seq_length: maximal sequence length the model can process
+        max_seq_overlap: overlap for chunking texts longer than the maximal sequence length
+        document_prefix: Prefix that should be added before all documents that are encoded for retrieval
     """
 
     def __init__(
@@ -57,7 +28,6 @@ class LateEmbedder:
         max_seq_length: int = 8192,
         max_seq_overlap: int = 500,
         document_prefix: str = "",
-        query_prefix: str = "",
         model_kwargs: dict | None = None,
     ) -> None:
         model_kwargs = model_kwargs if model_kwargs is not None else {}
@@ -65,7 +35,6 @@ class LateEmbedder:
         self.max_seq_length = max_seq_length
         self.max_seq_overlap = max_seq_overlap
         self._document_prefix = document_prefix
-        self._query_prefix = query_prefix
 
     def calculate_late_embeddings(
         self, input_text: str, chunk_annotations: list[tuple[int, int]]
@@ -75,6 +44,9 @@ class LateEmbedder:
         Args:
             input_text: a full text for which embeddings of chunks should be calculated
             chunk_annotations: a list of (chunk_start_index, chunk_end_index) that identify the chunks for the text
+
+        Returns:
+            np.ndarray of shape [number of chunks, embedding dimension]
         """
         token_embeddings, token_offsets = self._get_long_token_embeddings(input_text)
 
@@ -140,13 +112,11 @@ class LateEmbedder:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Handle inputs that might be longer than the embedding model can handle.
 
-        Adds document prefix before each chunk and excludes prefix tokens from output.
-
         Args:
             full_text: Text to tokenize. Can be longer than the maximum sequence length of the embedding model.
 
         Returns:
-            token_embeddings: embedding vectors for each token in the text (excluding prefix tokens)
+            token_embeddings: embedding vectors for each token in the text
             token_offsets: mapping of the tokens to their positions in the original text
         """
         prefix_length, leading_special, trailing_special = self._get_token_lengths()
@@ -259,12 +229,10 @@ class LateEmbedder:
     ) -> list[tuple[int, int]]:
         """Translate chunk boundaries from text to token space.
 
-        When using late chunking, the exact boundaries of chunks in token space
-        should not matter that much.
-
         Args:
             chunk_annotations: list of (chunk_start_index, chunk_end_index), positions measured in the text
-            token_offsets: list of (token_start_idndex, token_end_index), positions measured in the text
+            token_offsets: tensor of (token_start_index, token_end_index), positions measured in the text
+
         Returns:
             list of (chunk_start_token_index, chunk_end_token_index) for the tokenized text
         """
