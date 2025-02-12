@@ -94,11 +94,8 @@ class LateEmbedder:
 
         return pooled_embeddings
 
-    def _get_token_lengths(self, text: str) -> tuple[int, int, int]:
+    def _get_token_lengths(self) -> tuple[int, int, int]:
         """Calculate the number of tokens for prefix and special tokens.
-
-        Args:
-            text: The text to analyze
 
         Returns:
             tuple containing:
@@ -107,47 +104,42 @@ class LateEmbedder:
             - trailing_special_tokens: number of special tokens added at the end
         """
         # Get prefix length without special tokens
-        prefix_tokens = self.embedder.tokenizer(
-            self._document_prefix, 
-            add_special_tokens=False,
-            return_tensors="pt"
-        )
-        prefix_length = prefix_tokens["input_ids"].shape[1]
+        if self._document_prefix:
+            prefix_tokens = self.embedder.tokenizer(
+                self._document_prefix, add_special_tokens=False, return_tensors="pt"
+            )
+            prefix_length = prefix_tokens["input_ids"].shape[1]
+        else:
+            prefix_length = 0
 
+        text = "This is an example text."
         # Get number of special tokens by comparing with/without
-        text_tokens_with_special = self.embedder.tokenizer(
-            text,
-            return_tensors="pt"
-        )
+        text_tokens_with_special = self.embedder.tokenizer(text, return_tensors="pt")
         text_tokens_without_special = self.embedder.tokenizer(
-            text,
-            add_special_tokens=False,
-            return_tensors="pt"
+            text, add_special_tokens=False, return_tensors="pt"
         )
-        
-        total_special_tokens = (
-            text_tokens_with_special["input_ids"].shape[1] - 
-            text_tokens_without_special["input_ids"].shape[1]
-        )
-        
+
         # Compare token IDs to identify special tokens
         tokens_with = text_tokens_with_special["input_ids"][0]
         tokens_without = text_tokens_without_special["input_ids"][0]
-        
+
         # Count leading special tokens by comparing from the start
         leading_special_tokens = 0
-        while (leading_special_tokens < len(tokens_with) and 
-               (leading_special_tokens >= len(tokens_without) or
-                tokens_with[leading_special_tokens] != tokens_without[leading_special_tokens])):
+        while tokens_with[leading_special_tokens] != tokens_without[0]:
             leading_special_tokens += 1
-            
+
+        while leading_special_tokens < len(tokens_with) and (
+            leading_special_tokens >= len(tokens_without)
+            or tokens_with[leading_special_tokens]
+            != tokens_without[leading_special_tokens]
+        ):
+            leading_special_tokens += 1
+
         # Count trailing special tokens by comparing from the end
         trailing_special_tokens = 0
-        while (trailing_special_tokens < len(tokens_with) - leading_special_tokens and
-               (trailing_special_tokens >= len(tokens_without) or
-                tokens_with[-(trailing_special_tokens + 1)] != tokens_without[-(trailing_special_tokens + 1)])):
+        while tokens_with[-(trailing_special_tokens + 1)] != tokens_without[-1]:
             trailing_special_tokens += 1
-        
+
         return prefix_length, leading_special_tokens, trailing_special_tokens
 
     def _get_long_token_embeddings(
@@ -164,20 +156,25 @@ class LateEmbedder:
             token_embeddings: embedding vectors for each token in the text (excluding prefix tokens)
             token_offsets: mapping of the tokens to their positions in the original text
         """
-        # Get token lengths for prefix and special tokens
-        prefix_length, leading_special, trailing_special = self._get_token_lengths(full_text)
-        
-        # Tokenize full text to get offsets, without special tokens to match the original text
+        prefix_length, leading_special, trailing_special = self._get_token_lengths()
+
+        # Tokenize full text to get offsets
         base_tokens = self.embedder.tokenizer(
-            full_text, return_offsets_mapping=True, return_tensors="pt", verbose=False
+            full_text,
+            return_offsets_mapping=True,
+            return_tensors="pt",
+            verbose=False,
+            add_special_tokens=False,
         )
         n_tokens = base_tokens["input_ids"].numel()
         token_offsets = base_tokens["offset_mapping"].squeeze()
 
         device = self.embedder.device
 
-        if n_tokens <= self.max_seq_length - prefix_length:
-            # For short texts, add prefix once
+        if (
+            n_tokens
+            <= self.max_seq_length - prefix_length - leading_special - trailing_special
+        ):
             tokens = self.embedder.tokenizer(
                 self._document_prefix + full_text,
                 return_tensors="pt",
@@ -195,33 +192,39 @@ class LateEmbedder:
             # Exclude prefix tokens and leading special tokens from output
             start_idx = leading_special + prefix_length
             end_idx = -trailing_special if trailing_special > 0 else None
-            token_embeddings = model_output["token_embeddings"].squeeze(0)[start_idx:end_idx]
+            token_embeddings = model_output["token_embeddings"].squeeze(0)[
+                start_idx:end_idx
+            ]
         else:
-            chunks = []
             chunk_embeddings = []
 
             # Create chunks with overlap, adding prefix to each
             for i in range(
-                0, n_tokens, self.max_seq_length - self.max_seq_overlap - prefix_length
+                0,
+                n_tokens,
+                self.max_seq_length
+                - self.max_seq_overlap
+                - prefix_length
+                - leading_special
+                - trailing_special,
             ):
+                chunk_end = min(
+                    i
+                    + self.max_seq_length
+                    - prefix_length
+                    - leading_special
+                    - trailing_special,
+                    n_tokens,
+                )
                 chunk_text = (
                     self._document_prefix
-                    + full_text[
-                        token_offsets[i, 0].item() : token_offsets[
-                            min(i + self.max_seq_length - prefix_length, n_tokens - 1),
-                            1,
-                        ].item()
-                    ]
+                    + full_text[token_offsets[i, 0] : token_offsets[chunk_end - 1, 1]]
                 )
                 chunk = self.embedder.tokenizer(chunk_text, return_tensors="pt")
                 chunk = {
                     k: v.to(device) if isinstance(v, torch.Tensor) else v
                     for k, v in chunk.items()
                 }
-                chunks.append(chunk)
-
-            # Get embeddings for each chunk
-            for chunk in chunks:
                 with torch.no_grad():
                     chunk_output = self.embedder(chunk)
                 # Exclude prefix tokens and special tokens
