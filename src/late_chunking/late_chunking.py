@@ -106,33 +106,26 @@ class LateEmbedder:
         # Get prefix length without special tokens
         if self._document_prefix:
             prefix_tokens = self.embedder.tokenizer(
-                self._document_prefix, add_special_tokens=False, return_tensors="pt"
+                self._document_prefix, add_special_tokens=False
             )
-            prefix_length = prefix_tokens["input_ids"].shape[1]
+            prefix_length = len(prefix_tokens["input_ids"])
         else:
             prefix_length = 0
 
         text = "This is an example text."
         # Get number of special tokens by comparing with/without
-        text_tokens_with_special = self.embedder.tokenizer(text, return_tensors="pt")
+        text_tokens_with_special = self.embedder.tokenizer(text)
         text_tokens_without_special = self.embedder.tokenizer(
-            text, add_special_tokens=False, return_tensors="pt"
+            text, add_special_tokens=False
         )
 
         # Compare token IDs to identify special tokens
-        tokens_with = text_tokens_with_special["input_ids"][0]
-        tokens_without = text_tokens_without_special["input_ids"][0]
+        tokens_with = text_tokens_with_special["input_ids"]
+        tokens_without = text_tokens_without_special["input_ids"]
 
         # Count leading special tokens by comparing from the start
         leading_special_tokens = 0
         while tokens_with[leading_special_tokens] != tokens_without[0]:
-            leading_special_tokens += 1
-
-        while leading_special_tokens < len(tokens_with) and (
-            leading_special_tokens >= len(tokens_without)
-            or tokens_with[leading_special_tokens]
-            != tokens_without[leading_special_tokens]
-        ):
             leading_special_tokens += 1
 
         # Count trailing special tokens by comparing from the end
@@ -199,7 +192,7 @@ class LateEmbedder:
             chunk_embeddings = []
 
             # Create chunks with overlap, adding prefix to each
-            for i in range(
+            for chunk_start in range(
                 0,
                 n_tokens,
                 self.max_seq_length
@@ -209,7 +202,7 @@ class LateEmbedder:
                 - trailing_special,
             ):
                 chunk_end = min(
-                    i
+                    chunk_start
                     + self.max_seq_length
                     - prefix_length
                     - leading_special
@@ -218,7 +211,9 @@ class LateEmbedder:
                 )
                 chunk_text = (
                     self._document_prefix
-                    + full_text[token_offsets[i, 0] : token_offsets[chunk_end - 1, 1]]
+                    + full_text[
+                        token_offsets[chunk_start, 0] : token_offsets[chunk_end - 1, 1]
+                    ]
                 )
                 chunk = self.embedder.tokenizer(chunk_text, return_tensors="pt")
                 chunk = {
@@ -246,7 +241,13 @@ class LateEmbedder:
                 chunk_size = chunk_emb.shape[0]
                 token_embeddings[pos : pos + chunk_size] += chunk_emb
                 counts[pos : pos + chunk_size] += 1
-                pos += self.max_seq_length - self.max_seq_overlap - prefix_length
+                pos += (
+                    self.max_seq_length
+                    - self.max_seq_overlap
+                    - prefix_length
+                    - leading_special
+                    - trailing_special
+                )
 
             # Average overlapping regions
             token_embeddings = token_embeddings / counts.unsqueeze(1)
