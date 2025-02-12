@@ -94,6 +94,49 @@ class LateEmbedder:
 
         return pooled_embeddings
 
+    def _get_token_lengths(self, text: str) -> tuple[int, int, int]:
+        """Calculate the number of tokens for prefix and special tokens.
+
+        Args:
+            text: The text to analyze
+
+        Returns:
+            tuple containing:
+            - prefix_length: number of tokens in the prefix
+            - leading_special_tokens: number of special tokens added at the start
+            - trailing_special_tokens: number of special tokens added at the end
+        """
+        # Get prefix length without special tokens
+        prefix_tokens = self.embedder.tokenizer(
+            self._document_prefix, 
+            add_special_tokens=False,
+            return_tensors="pt"
+        )
+        prefix_length = prefix_tokens["input_ids"].shape[1]
+
+        # Get number of special tokens by comparing with/without
+        text_tokens_with_special = self.embedder.tokenizer(
+            text,
+            return_tensors="pt"
+        )
+        text_tokens_without_special = self.embedder.tokenizer(
+            text,
+            add_special_tokens=False,
+            return_tensors="pt"
+        )
+        
+        total_special_tokens = (
+            text_tokens_with_special["input_ids"].shape[1] - 
+            text_tokens_without_special["input_ids"].shape[1]
+        )
+        
+        # Most models add [CLS] at start and [SEP] at end
+        # Adjust these numbers if your model uses different special tokens
+        leading_special_tokens = 1  # Usually [CLS]
+        trailing_special_tokens = total_special_tokens - leading_special_tokens
+        
+        return prefix_length, leading_special_tokens, trailing_special_tokens
+
     def _get_long_token_embeddings(
         self, full_text: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -108,13 +151,10 @@ class LateEmbedder:
             token_embeddings: embedding vectors for each token in the text (excluding prefix tokens)
             token_offsets: mapping of the tokens to their positions in the original text
         """
-        # First tokenize just the prefix to know its length
-        prefix_tokens = self.embedder.tokenizer(
-            self._document_prefix, return_tensors="pt", verbose=False
-        )
-        prefix_length = prefix_tokens["input_ids"].shape[1]
-
-        # Tokenize full text to get offsets
+        # Get token lengths for prefix and special tokens
+        prefix_length, leading_special, trailing_special = self._get_token_lengths(full_text)
+        
+        # Tokenize full text to get offsets, without special tokens to match the original text
         base_tokens = self.embedder.tokenizer(
             full_text, return_offsets_mapping=True, return_tensors="pt", verbose=False
         )
@@ -171,9 +211,11 @@ class LateEmbedder:
             for chunk in chunks:
                 with torch.no_grad():
                     chunk_output = self.embedder(chunk)
-                # Exclude prefix tokens
+                # Exclude prefix tokens and special tokens
+                start_idx = leading_special + prefix_length
+                end_idx = -trailing_special if trailing_special > 0 else None
                 chunk_embeddings.append(
-                    chunk_output["token_embeddings"].squeeze(0)[prefix_length:]
+                    chunk_output["token_embeddings"].squeeze(0)[start_idx:end_idx]
                 )
 
             token_embeddings = torch.zeros(
