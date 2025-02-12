@@ -127,11 +127,9 @@ class LateEmbedder:
             # For short texts, add prefix once
             tokens = self.embedder.tokenizer(
                 self._document_prefix + full_text,
-                return_offsets_mapping=True,
                 return_tensors="pt",
-                verbose=False,
             )
-            
+
             for key in tokens:
                 tokens[key] = (
                     tokens[key].to(device)
@@ -142,43 +140,51 @@ class LateEmbedder:
                 model_output = self.embedder(tokens)
 
             # Exclude prefix tokens from output
-            token_embeddings = model_output["token_embeddings"].squeeze(0)[prefix_length:]
+            token_embeddings = model_output["token_embeddings"].squeeze(0)[
+                prefix_length:
+            ]
         else:
-            _chunks = []
-            _chunk_embeddings = []
+            chunks = []
+            chunk_embeddings = []
 
             # Create chunks with overlap, adding prefix to each
-            for i in range(0, n_tokens, self.max_seq_length - self.max_seq_overlap - prefix_length):
-                chunk_text = self._document_prefix + full_text[
-                    token_offsets[i, 0].item():token_offsets[min(i + self.max_seq_length - prefix_length, n_tokens - 1), 1].item()
-                ]
-                _chunk = self.embedder.tokenizer(
-                    chunk_text,
-                    return_tensors="pt",
-                    verbose=False
+            for i in range(
+                0, n_tokens, self.max_seq_length - self.max_seq_overlap - prefix_length
+            ):
+                chunk_text = (
+                    self._document_prefix
+                    + full_text[
+                        token_offsets[i, 0].item() : token_offsets[
+                            min(i + self.max_seq_length - prefix_length, n_tokens - 1),
+                            1,
+                        ].item()
+                    ]
                 )
-                _chunk = {
+                chunk = self.embedder.tokenizer(chunk_text, return_tensors="pt")
+                chunk = {
                     k: v.to(device) if isinstance(v, torch.Tensor) else v
-                    for k, v in _chunk.items()
+                    for k, v in chunk.items()
                 }
-                _chunks.append(_chunk)
+                chunks.append(chunk)
 
             # Get embeddings for each chunk
-            for _chunk in _chunks:
+            for chunk in chunks:
                 with torch.no_grad():
-                    chunk_output = self.embedder(_chunk)
+                    chunk_output = self.embedder(chunk)
                 # Exclude prefix tokens
-                _chunk_embeddings.append(chunk_output["token_embeddings"].squeeze(0)[prefix_length:])
+                chunk_embeddings.append(
+                    chunk_output["token_embeddings"].squeeze(0)[prefix_length:]
+                )
 
             token_embeddings = torch.zeros(
-                (n_tokens, _chunk_embeddings[0].shape[1]),
-                dtype=_chunk_embeddings[0].dtype,
+                (n_tokens, chunk_embeddings[0].shape[1]),
+                dtype=chunk_embeddings[0].dtype,
             ).to(device)
 
             counts = torch.zeros(n_tokens, dtype=torch.int).to(device)
 
             pos = 0
-            for chunk_emb in _chunk_embeddings:
+            for chunk_emb in chunk_embeddings:
                 chunk_size = chunk_emb.shape[0]
                 token_embeddings[pos : pos + chunk_size] += chunk_emb
                 counts[pos : pos + chunk_size] += 1
