@@ -130,10 +130,23 @@ class LateEmbedder:
             text_tokens_without_special["input_ids"].shape[1]
         )
         
-        # Most models add [CLS] at start and [SEP] at end
-        # Adjust these numbers if your model uses different special tokens
-        leading_special_tokens = 1  # Usually [CLS]
-        trailing_special_tokens = total_special_tokens - leading_special_tokens
+        # Compare token IDs to identify special tokens
+        tokens_with = text_tokens_with_special["input_ids"][0]
+        tokens_without = text_tokens_without_special["input_ids"][0]
+        
+        # Count leading special tokens by comparing from the start
+        leading_special_tokens = 0
+        while (leading_special_tokens < len(tokens_with) and 
+               (leading_special_tokens >= len(tokens_without) or
+                tokens_with[leading_special_tokens] != tokens_without[leading_special_tokens])):
+            leading_special_tokens += 1
+            
+        # Count trailing special tokens by comparing from the end
+        trailing_special_tokens = 0
+        while (trailing_special_tokens < len(tokens_with) - leading_special_tokens and
+               (trailing_special_tokens >= len(tokens_without) or
+                tokens_with[-(trailing_special_tokens + 1)] != tokens_without[-(trailing_special_tokens + 1)])):
+            trailing_special_tokens += 1
         
         return prefix_length, leading_special_tokens, trailing_special_tokens
 
