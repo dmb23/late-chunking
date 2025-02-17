@@ -3,6 +3,7 @@ name = "late-chunking"
 version = "0.1.0"
 description = "Applying late chunking as developed by Jina AI"
 readme = "README.md"
+license = "Apache-2.0"
 authors = [
     { name = "Mischa Ungermann", email = "mischa@dataworkz.de" }
 ]
